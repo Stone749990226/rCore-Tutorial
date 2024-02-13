@@ -1,0 +1,16 @@
+[package]
+name = "os"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+# RustSBI 开源社区的 sbi_rt 封装了调用 SBI 服务的接口
+[dependencies]
+riscv = { git = "https://github.com/rcore-os/riscv", features = ["inline-asm"] }
+sbi-rt = { version = "0.0.2", features = ["legacy"] }
+log = "0.4"
+lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
+
+[profile.release]
+debug = true
