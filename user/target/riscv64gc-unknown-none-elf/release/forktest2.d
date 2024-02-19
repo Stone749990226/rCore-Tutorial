@@ -1,0 +1,1 @@
+/root/mycore/user/target/riscv64gc-unknown-none-elf/release/forktest2: /root/mycore/user/src/bin/forktest2.rs /root/mycore/user/src/console.rs /root/mycore/user/src/lang_items.rs /root/mycore/user/src/lib.rs /root/mycore/user/src/syscall.rs

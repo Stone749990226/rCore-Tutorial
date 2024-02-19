@@ -11,6 +11,10 @@ riscv = { git = "https://github.com/rcore-os/riscv", features = ["inline-asm"] }
 sbi-rt = { version = "0.0.2", features = ["legacy"] }
 log = "0.4"
 lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
+# 将我们的动态内存分配器类型实例化为一个全局变量，并使用 #[global_allocator] 语义项标记即可。由于该分配器的实现比较复杂，我们这里直接使用一个已有的伙伴分配器实现
+buddy_system_allocator = "0.6"
+bitflags = "1.2.1"
+xmas-elf = "0.7.0"
 
 [profile.release]
 debug = true

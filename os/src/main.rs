@@ -3,6 +3,13 @@
 #![no_main]
 // 需要在 main.rs 开头加上 #![feature(panic_info_message)] 才能通过 PanicInfo::message 获取报错信息
 #![feature(panic_info_message)]
+#![feature(alloc_error_handler)]
+
+// 需要引入 alloc 库的依赖，由于它算是 Rust 内置的 crate ，我们并不是在 Cargo.toml 中进行引入，而是在 main.rs 中声明即可
+extern crate alloc;
+
+#[macro_use]
+extern crate bitflags;
 
 #[path = "boards/qemu.rs"]
 mod board;
@@ -12,6 +19,7 @@ mod console;
 mod config;
 mod lang_items;
 mod loader;
+mod mm;
 mod sbi;
 // 第二章专属模块，后面弃用
 // pub mod batch;
@@ -33,15 +41,18 @@ global_asm!(include_str!("link_app.S"));
 // 这里需要注意的是需要通过宏将 rust_main 标记为 #[no_mangle] 以避免编译器对它的名字进行混淆，不然在链接的时候， entry.asm 将找不到 main.rs 提供的外部符号 rust_main 从而导致链接失败
 #[no_mangle]
 pub fn rust_main() -> ! {
-    
     clear_bss();
-    // logging::init();
     println!("[kernel] Hello, world!");
+    mm::init();
+    mm::remap_test();
+    task::add_initproc();
+    println!("after initproc!");
     trap::init();
-    loader::load_apps();
+    //trap::enable_interrupt();
     trap::enable_timer_interrupt();
     timer::set_next_trigger();
-    task::run_first_task();
+    loader::list_apps();
+    task::run_tasks();
     panic!("Unreachable in rust_main!");
 }
 

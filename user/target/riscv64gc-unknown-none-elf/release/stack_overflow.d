@@ -1,0 +1,1 @@
+/root/mycore/user/target/riscv64gc-unknown-none-elf/release/stack_overflow: /root/mycore/user/src/bin/stack_overflow.rs /root/mycore/user/src/console.rs /root/mycore/user/src/lang_items.rs /root/mycore/user/src/lib.rs /root/mycore/user/src/syscall.rs

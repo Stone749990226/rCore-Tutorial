@@ -1,0 +1,1 @@
+/root/mycore/user/target/riscv64gc-unknown-none-elf/release/01power_5: /root/mycore/user/src/bin/01power_5.rs /root/mycore/user/src/console.rs /root/mycore/user/src/lang_items.rs /root/mycore/user/src/lib.rs /root/mycore/user/src/syscall.rs

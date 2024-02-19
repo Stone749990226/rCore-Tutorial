@@ -1,0 +1,1 @@
+/root/mycore/user/target/riscv64gc-unknown-none-elf/release/sleep_simple: /root/mycore/user/src/bin/sleep_simple.rs /root/mycore/user/src/console.rs /root/mycore/user/src/lang_items.rs /root/mycore/user/src/lib.rs /root/mycore/user/src/syscall.rs

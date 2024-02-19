@@ -18,6 +18,11 @@ SECTIONS
     .text : {
         /* 将包含内核第一条指令的 .text.entry 段放在最终的 .text 段的最开头，同时注意到在最终内存布局中代码段 .text 又是先于任何其他段的。因为所有的段都从 BASE_ADDRESS 也即 0x80200000 开始放置，这就能够保证内核的第一条指令正好放在 0x80200000 从而能够正确对接到 Qemu 上 */
         *(.text.entry)
+        /* 将 trap.S 中的整段汇编代码放置在 .text.trampoline 段，并在调整内存布局的时候将它对齐到代码段的一个页面中 */
+        . = ALIGN(4K);
+        strampoline = .;
+        *(.text.trampoline);
+        . = ALIGN(4K);
         *(.text .text.*)
     }
 
@@ -39,6 +44,7 @@ SECTIONS
 
     . = ALIGN(4K);
     edata = .;
+    sbss_with_stack = .;
     .bss : {
         *(.bss.stack)
         sbss = .;
