@@ -1,6 +1,6 @@
 //! App management syscalls
 // use crate::batch::run_next_app;
-use crate::loader::get_app_data_by_name;
+use crate::fs::{open_file, OpenFlags};
 use crate::mm::{translated_refmut, translated_str};
 use crate::task::{
     add_task, current_task, current_user_token, exit_current_and_run_next,
@@ -8,6 +8,7 @@ use crate::task::{
 };
 use crate::timer::get_time_ms;
 use alloc::sync::Arc;
+
 pub fn sys_exit(exit_code: i32) -> ! {
     exit_current_and_run_next(exit_code);
     panic!("Unreachable in sys_exit!");
@@ -65,16 +66,28 @@ pub fn sys_exec(path: *const u8) -> isize {
     let token = current_user_token();
     // 调用 translated_str 找到要执行的应用名
     let path = translated_str(token, path);
-    // 在应用加载器提供的 get_app_data_by_name 接口中找到对应的 ELF 格式的数据
-    if let Some(data) = get_app_data_by_name(path.as_str()) {
-        // 如果找到，就调用 TaskControlBlock::exec 替换掉地址空间并返回 0。这个返回值其实并没有意义，因为我们在替换地址空间的时候本来就对 Trap 上下文重新进行了初始化
+    // 有了文件系统支持之后，我们在 sys_exec 所需的应用的 ELF 文件格式的数据就不再需要通过应用加载器从内核的数据段获取，而是从文件系统中获取，这样内核与应用的代码/数据就解耦了
+    // 调用 open_file 函数，以只读的方式在内核中打开应用文件并获取它对应的 OSInode
+    if let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
+        // 通过 OSInode::read_all 将该文件的数据全部读到一个向量 all_data 中
+        let all_data = app_inode.read_all();
         let task = current_task().unwrap();
-        task.exec(data);
+        task.exec(all_data.as_slice());
         0
     } else {
-        // 如果没有找到，就不做任何事情并返回 -1。在shell程序user_shell中我们也正是通过这个返回值来判断要执行的应用是否存在
         -1
     }
+    // ch6之前：
+    // 在应用加载器提供的 get_app_data_by_name 接口中找到对应的 ELF 格式的数据
+    // if let Some(data) = get_app_data_by_name(path.as_str()) {
+    //     // 如果找到，就调用 TaskControlBlock::exec 替换掉地址空间并返回 0。这个返回值其实并没有意义，因为我们在替换地址空间的时候本来就对 Trap 上下文重新进行了初始化
+    //     let task = current_task().unwrap();
+    //     task.exec(data);
+    //     0
+    // } else {
+    //     // 如果没有找到，就不做任何事情并返回 -1。在shell程序user_shell中我们也正是通过这个返回值来判断要执行的应用是否存在
+    //     -1
+    // }
 }
 
 /// 功能：当前进程等待一个子进程变为僵尸进程，回收其全部资源并收集其返回值。

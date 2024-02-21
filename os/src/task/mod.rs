@@ -18,19 +18,20 @@ mod switch;
 // #[allow] 是一个属性(attribute)，它用于禁止指定 lint 的警告。Lint 是 Rust 编译器提供的一种代码检查机制，用于帮助开发者发现潜在的问题或者不规范的代码风格。
 // #[allow(clippy::module_inception)] 意味着允许发生 module_inception 这个 lint，而不会给出警告。
 #[allow(clippy::module_inception)]
+#[allow(rustdoc::private_intra_doc_links)]
 mod task;
 
 // use crate::config::MAX_APP_NUM;
 // use crate::loader::{get_num_app, init_app_cx};
-use crate::loader::get_app_data_by_name;
+use crate::fs::{open_file, OpenFlags};
 use crate::sbi::shutdown;
 use alloc::sync::Arc;
+pub use context::TaskContext;
 use lazy_static::*;
 pub use manager::{fetch_task, TaskManager};
 use switch::__switch;
 use task::{TaskControlBlock, TaskStatus};
 
-pub use context::TaskContext;
 pub use manager::add_task;
 pub use pid::{pid_alloc, KernelStack, PidAllocator, PidHandle};
 pub use processor::{
@@ -125,10 +126,11 @@ pub fn exit_current_and_run_next(exit_code: i32) {
 lazy_static! {
     // 调用 TaskControlBlock::new 来创建一个进程控制块，它需要传入 ELF 可执行文件的数据切片作为参数
     ///Globle process that init user shell
-    pub static ref INITPROC: Arc<TaskControlBlock> = Arc::new(TaskControlBlock::new(
-        // 通过加载器 loader 子模块提供的 get_app_data_by_name 接口查找 initproc 的 ELF 执行文件数据来获得
-        get_app_data_by_name("initproc").unwrap()
-    ));
+    pub static ref INITPROC: Arc<TaskControlBlock> = Arc::new({
+        let inode = open_file("initproc", OpenFlags::RDONLY).unwrap();
+        let v = inode.read_all();
+        TaskControlBlock::new(v.as_slice())
+    });
 }
 ///Add init process to the manager
 pub fn add_initproc() {

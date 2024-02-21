@@ -8,8 +8,7 @@ use user_lib::{exec, fork, wait, yield_};
 
 #[no_mangle]
 fn main() -> i32 {
-    if fork() == 0 { //子进程
-        // 需要在字符串末尾手动加入 \0 ，因为 Rust 在将这些字符串连接到只读数据段的时候不会插入 \0
+    if fork() == 0 {
         exec("user_shell\0");
     } else {
         loop {

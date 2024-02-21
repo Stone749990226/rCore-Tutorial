@@ -1,12 +1,15 @@
 //! Constants used in rCore for qemu
 // 常数 CLOCK_FREQ 是一个预先获取到的各平台不同的时钟频率，单位为赫兹，也就是一秒钟之内计数器的增量
 pub const CLOCK_FREQ: usize = 12500000;
-pub const MEMORY_END: usize = 0x81000000;
+pub const MEMORY_END: usize = 0x88000000;
 
+// 硬编码 Qemu 上的 VirtIO 总线的 MMIO 地址区间（起始地址，长度）
 pub const MMIO: &[(usize, usize)] = &[
     (0x0010_0000, 0x00_2000), // VIRT_TEST/RTC  in virt machine
+    (0x1000_1000, 0x00_1000), // Virtio Block in virt machine
 ];
 
+pub type BlockDeviceImpl = crate::drivers::block::VirtIOBlock;
 //下面为ch3-coop分支下的代码
 // //ref:: https://github.com/andre-richter/qemu-exit
 // use core::arch::asm;

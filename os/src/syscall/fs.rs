@@ -1,56 +1,72 @@
 //! File and filesystem-related syscalls
-use crate::mm::translated_byte_buffer;
-use crate::sbi::console_getchar;
-use crate::task::{current_user_token, suspend_current_and_run_next};
+use crate::fs::{open_file, OpenFlags};
+use crate::mm::{translated_byte_buffer, translated_str, UserBuffer};
+use crate::task::{current_task, current_user_token};
 
-const FD_STDIN: usize = 0;
-const FD_STDOUT: usize = 1;
-
+// 基于文件抽象接口和文件描述符表，我们可以按照无结构的字节流来处理基本的文件读写，这样可以让文件读写系统调用 sys_read/write 变得更加具有普适性
 pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
-    match fd {
-        FD_STDOUT => {
-            let buffers = translated_byte_buffer(current_user_token(), buf, len);
-            for buffer in buffers {
-                print!("{}", core::str::from_utf8(buffer).unwrap());
-            }
-            len as isize
-            // let slice = unsafe { core::slice::from_raw_parts(buf, len) };
-            // let str = core::str::from_utf8(slice).unwrap();
-            // print!("{}", str);
-            // len as isize
-        },
-        _ => {
-            panic!("Unsupported fd in sys_write!");
+    let token = current_user_token();
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return -1;
+    }
+    if let Some(file) = &inner.fd_table[fd] {
+        if !file.writable() {
+            return -1;
         }
+        let file = file.clone();
+        // release current task TCB manually to avoid multi-borrow
+        drop(inner);
+        file.write(UserBuffer::new(translated_byte_buffer(token, buf, len))) as isize
+    } else {
+        -1
     }
 }
-// 目前仅支持从标准输入 FD_STDIN 即文件描述符 0 读入，且单次读入的长度限制为 1，即每次只能读入一个字符
+
 pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
-    match fd {
-        FD_STDIN => {
-            assert_eq!(len, 1, "Only support len = 1 in sys_read!");
-            let mut c: usize;
-            loop {
-                // 调用 sbi 子模块提供的从键盘获取输入的接口 console_getchar ，如果返回 0 则说明还没有输入
-                c = console_getchar();
-                if c == 0 {
-                    // 调用 suspend_current_and_run_next 暂时切换到其他进程，等下次切换回来的时候再看看是否有输入了
-                    suspend_current_and_run_next();
-                    continue;
-                } else {
-                    break;
-                }
-            }
-            // 获取到输入之后，我们退出循环并手动查页表将输入的字符正确的写入到应用地址空间
-            let ch = c as u8;
-            let mut buffers = translated_byte_buffer(current_user_token(), buf, len);
-            unsafe {
-                buffers[0].as_mut_ptr().write_volatile(ch);
-            }
-            1
-        }
-        _ => {
-            panic!("Unsupported fd in sys_read!");
-        }
+    let token = current_user_token();
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return -1;
     }
+    if let Some(file) = &inner.fd_table[fd] {
+        let file = file.clone();
+        if !file.readable() {
+            return -1;
+        }
+        // release current task TCB manually to avoid multi-borrow
+        drop(inner);
+        file.read(UserBuffer::new(translated_byte_buffer(token, buf, len))) as isize
+    } else {
+        -1
+    }
+}
+
+pub fn sys_open(path: *const u8, flags: u32) -> isize {
+    let task = current_task().unwrap();
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    if let Some(inode) = open_file(path.as_str(), OpenFlags::from_bits(flags).unwrap()) {
+        let mut inner = task.inner_exclusive_access();
+        let fd = inner.alloc_fd();
+        inner.fd_table[fd] = Some(inode);
+        fd as isize
+    } else {
+        -1
+    }
+}
+
+pub fn sys_close(fd: usize) -> isize {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return -1;
+    }
+    if inner.fd_table[fd].is_none() {
+        return -1;
+    }
+    inner.fd_table[fd].take();
+    0
 }

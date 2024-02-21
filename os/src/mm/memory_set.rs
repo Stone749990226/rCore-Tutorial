@@ -33,6 +33,10 @@ lazy_static! {
     pub static ref KERNEL_SPACE: Arc<UPSafeCell<MemorySet>> =
         Arc::new(unsafe { UPSafeCell::new(MemorySet::new_kernel()) });
 }
+///Get kernelspace root ppn
+pub fn kernel_token() -> usize {
+    KERNEL_SPACE.exclusive_access().token()
+}
 
 /// memory set structure, controls virtual-memory space
 pub struct MemorySet {
@@ -160,6 +164,7 @@ impl MemorySet {
                 MapArea::new(
                     (*pair).0.into(),
                     ((*pair).0 + (*pair).1).into(),
+                    // 透明的恒等映射，从而让内核可以兼容于直接访问物理地址的设备驱动库
                     MapType::Identical,
                     MapPermission::R | MapPermission::W,
                 ),

@@ -17,17 +17,19 @@ mod board;
 #[macro_use]
 mod console;
 mod config;
-mod lang_items;
-mod loader;
-mod mm;
-mod sbi;
+mod drivers;
+pub mod fs;
+pub mod lang_items;
+pub mod loader;
+pub mod mm;
+pub mod sbi;
 // 第二章专属模块，后面弃用
 // pub mod batch;
-mod sync;
+pub mod sync;
 pub mod syscall;
 pub mod task;
 // ch3引入模块
-mod timer;
+pub mod timer;
 pub mod trap;
 
 // use log::*;
@@ -45,13 +47,12 @@ pub fn rust_main() -> ! {
     println!("[kernel] Hello, world!");
     mm::init();
     mm::remap_test();
-    task::add_initproc();
-    println!("after initproc!");
     trap::init();
     //trap::enable_interrupt();
     trap::enable_timer_interrupt();
     timer::set_next_trigger();
-    loader::list_apps();
+    fs::list_apps();
+    task::add_initproc();
     task::run_tasks();
     panic!("Unreachable in rust_main!");
 }
