@@ -20,7 +20,7 @@ mod config;
 mod drivers;
 pub mod fs;
 pub mod lang_items;
-pub mod loader;
+// pub mod loader;
 pub mod mm;
 pub mod sbi;
 // 第二章专属模块，后面弃用

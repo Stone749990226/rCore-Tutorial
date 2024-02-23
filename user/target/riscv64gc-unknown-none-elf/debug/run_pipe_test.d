@@ -1,0 +1,1 @@
+/root/mycore/user/target/riscv64gc-unknown-none-elf/debug/run_pipe_test: /root/mycore/user/src/bin/run_pipe_test.rs /root/mycore/user/src/console.rs /root/mycore/user/src/lang_items.rs /root/mycore/user/src/lib.rs /root/mycore/user/src/syscall.rs

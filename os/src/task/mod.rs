@@ -9,10 +9,12 @@
 //! Be careful when you see `__switch` ASM function in `switch.S`. Control flow around this function
 //! might not be what you expect.
 
+mod action;
 mod context;
 mod manager;
 mod pid;
 mod processor;
+mod signal;
 mod switch;
 
 // #[allow] 是一个属性(attribute)，它用于禁止指定 lint 的警告。Lint 是 Rust 编译器提供的一种代码检查机制，用于帮助开发者发现潜在的问题或者不规范的代码风格。
@@ -28,16 +30,18 @@ use crate::sbi::shutdown;
 use alloc::sync::Arc;
 pub use context::TaskContext;
 use lazy_static::*;
-pub use manager::{fetch_task, TaskManager};
+use manager::fetch_task;
+use manager::remove_from_pid2task;
 use switch::__switch;
 use task::{TaskControlBlock, TaskStatus};
 
-pub use manager::add_task;
-pub use pid::{pid_alloc, KernelStack, PidAllocator, PidHandle};
+pub use action::{SignalAction, SignalActions};
+pub use manager::{add_task, pid2task};
+pub use pid::{pid_alloc, KernelStack, PidHandle};
 pub use processor::{
     current_task, current_trap_cx, current_user_token, run_tasks, schedule, take_current_task,
-    Processor,
 };
+pub use signal::{SignalFlags, MAX_SIG};
 
 
 /// Suspend the current 'Running' task and run the next task in task list.
@@ -87,7 +91,8 @@ pub fn exit_current_and_run_next(exit_code: i32) {
             shutdown(false)
         }
     }
-
+    // remove from pid2task
+    remove_from_pid2task(task.getpid());
     // **** access current TCB exclusively
     let mut inner = task.inner_exclusive_access();
     // 进程控制块中的状态修改为 TaskStatus::Zombie 即僵尸进程，这样它后续才能被父进程在 waitpid 系统调用的时候回收
@@ -137,7 +142,144 @@ pub fn add_initproc() {
     add_task(INITPROC.clone());
 }
 
+pub fn check_signals_error_of_current() -> Option<(i32, &'static str)> {
+    let task = current_task().unwrap();
+    let task_inner = task.inner_exclusive_access();
+    // println!(
+    //     "[K] check_signals_error_of_current {:?}",
+    //     task_inner.signals
+    // );
+    task_inner.signals.check_error()
+}
 
+pub fn current_add_signal(signal: SignalFlags) {
+    let task = current_task().unwrap();
+    let mut task_inner = task.inner_exclusive_access();
+    task_inner.signals |= signal;
+    // println!(
+    //     "[K] current_add_signal:: current task sigflag {:?}",
+    //     task_inner.signals
+    // );
+}
+fn call_kernel_signal_handler(signal: SignalFlags) {
+    let task = current_task().unwrap();
+    let mut task_inner = task.inner_exclusive_access();
+    match signal {
+        SignalFlags::SIGSTOP => {
+            task_inner.frozen = true;
+            // 清除掉接收到的信号避免它们再次被处理
+            task_inner.signals ^= SignalFlags::SIGSTOP;
+        }
+        SignalFlags::SIGCONT => {
+            if task_inner.signals.contains(SignalFlags::SIGCONT) {
+                task_inner.signals ^= SignalFlags::SIGCONT;
+                task_inner.frozen = false;
+            }
+        }
+        // 对于其他的信号都按照默认的处理方式即杀死当前进程，于是将 killed 字段设置为真，这样的进程会在 Trap 返回用户态之前就通过调度切换到其他进程
+        _ => {
+            // println!(
+            //     "[K] call_kernel_signal_handler:: current task sigflag {:?}",
+            //     task_inner.signals
+            // );
+            task_inner.killed = true;
+        }
+    }
+}
+
+fn call_user_signal_handler(sig: usize, signal: SignalFlags) {
+    let task = current_task().unwrap();
+    let mut task_inner = task.inner_exclusive_access();
+    // 首先检查进程是否提供了该信号的处理例程，如果没有提供的话直接忽略该信号。否则就调用信号处理例程
+    let handler = task_inner.signal_actions.table[sig].handler;
+    if handler != 0 {
+        // user handler
+
+        // handle flag
+        task_inner.handling_sig = sig as isize;
+        task_inner.signals ^= signal;
+
+        // backup trapframe
+        let mut trap_ctx = task_inner.get_trap_cx();
+        task_inner.trap_ctx_backup = Some(*trap_ctx);
+
+        // 修改 Trap 上下文的 sepc 到应用设置的例程地址使得 Trap 回到用户态之后就会跳转到例程入口并开始执行
+        // modify trapframe
+        trap_ctx.sepc = handler;
+
+        // 修改 Trap 上下文的 a0 寄存器，使得信号类型能够作为参数被例程接收
+        // put args (a0)
+        trap_ctx.x[10] = sig;
+    } else {
+        // default action
+        println!("[K] task/call_user_signal_handler: default action: ignore it or kill process");
+    }
+}
+fn check_pending_signals() {
+    // 最外层循环遍历所有信号
+    for sig in 0..(MAX_SIG + 1) {
+        let task = current_task().unwrap();
+        let task_inner = task.inner_exclusive_access();
+        let signal = SignalFlags::from_bits(1 << sig).unwrap();
+        // 检查当前进程是否接收到了遍历到的信号（条件 1）以及该信号是否未被当前进程全局屏蔽（条件 2）
+        if task_inner.signals.contains(signal) && (!task_inner.signal_mask.contains(signal)) {
+            let mut masked = true;
+            let handling_sig = task_inner.handling_sig;
+            // 检查该信号是否未被当前正在执行的信号处理例程屏蔽（条件 3）
+            if handling_sig == -1 {
+                masked = false;
+            } else {
+                let handling_sig = handling_sig as usize;
+                if !task_inner.signal_actions.table[handling_sig]
+                    .mask
+                    .contains(signal)
+                {
+                    masked = false;
+                }
+            }
+            // 当 3 个条件全部满足的时候，开始处理该信号
+            if !masked {
+                drop(task_inner);
+                drop(task);
+                // 目前的设计是：如果信号类型为 SIGKILL/SIGSTOP/SIGCONT/SIGDEF 四者之一，则该信号只能由内核来处理
+                // 否则调用 call_user_signal_handler 函数尝试使用进程提供的信号处理例程来处理
+                if signal == SignalFlags::SIGKILL
+                    || signal == SignalFlags::SIGSTOP
+                    || signal == SignalFlags::SIGCONT
+                    || signal == SignalFlags::SIGDEF
+                {
+                    // signal is a kernel signal
+                    call_kernel_signal_handler(signal);
+                } else {
+                    // signal is a user signal
+                    call_user_signal_handler(sig, signal);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+// 在 trap_handler 完成 Trap 处理并返回用户态之前，会调用 handle_signals 函数处理当前进程此前接收到的信号
+// 当进程收到 SIGSTOP 信号之后，它的执行将被暂停，等到该进程收到 SIGCONT 信号之后再继续执行
+pub fn handle_signals() {
+    // 这个循环的意义在于：只要进程还处于暂停且未被杀死的状态就会停留在循环中等待 SIGCONT 信号的到来。
+    // 如果 frozen 为真，证明还没有收到 SIGCONT 信号，进程仍处于暂停状态
+    loop {
+        // check_pending_signals 会检查收到的信号并对它们进行处理，在这个过程中会更新 frozen 和 killed 字段
+        check_pending_signals();
+        let (frozen, killed) = {
+            let task = current_task().unwrap();
+            let task_inner = task.inner_exclusive_access();
+            (task_inner.frozen, task_inner.killed)
+        };
+        if !frozen || killed {
+            break;
+        }
+        // 循环的末尾我们调用 suspend_current_and_run_next 函数切换到其他进程期待其他进程将 SIGCONT 信号发过来
+        suspend_current_and_run_next();
+    }
+}
 // ch5之前：
 // 需要一个全局的任务管理器来管理这些用任务控制块描述的应用
 // pub struct TaskManager {

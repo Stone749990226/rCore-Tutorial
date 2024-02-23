@@ -1,11 +1,12 @@
 //!Implementation of [`TaskControlBlock`]
-use super::TaskContext;
-use super::{pid_alloc, KernelStack, PidHandle};
+use super::{pid_alloc, KernelStack, PidHandle, SignalFlags};
+use super::{SignalActions, TaskContext};
 use crate::config::TRAP_CONTEXT;
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
+use crate::mm::{translated_refmut, MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
 use crate::trap::{trap_handler, TrapContext};
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -58,6 +59,23 @@ pub struct TaskControlBlockInner {
     // Arc 首先提供了共享引用能力,可能会有多个进程共享同一个文件对它进行读写。此外被它包裹的内容会被放到内核堆而不是栈上，于是它便不需要在编译期有着确定的大小
     // dyn 关键字表明 Arc 里面的类型实现了 File/Send/Sync 三个 Trait ，但是编译期无法知道它具体是哪个类型（可能是任何实现了 File Trait 的类型如 Stdin/Stdout ，故而它所占的空间大小自然也无法确定），需要等到运行时才能知道它的具体类型，对于一些抽象方法的调用也是在那个时候才能找到该类型实现的方法并跳转过去
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
+    // signals 字段记录对应进程目前已经收到了哪些信号尚未处理，它的类型同样是 SignalFlags 表示一个信号集合
+    pub signals: SignalFlags,
+    // 进程的全局信号掩码
+    pub signal_mask: SignalFlags,
+    // handling_sig 表示进程正在执行哪个信号的处理例程
+    // the signal which is being handling
+    pub handling_sig: isize,
+    // Signal actions
+    pub signal_actions: SignalActions,
+    // killed 字段表示进程是否已被杀死
+    // if the task is killed
+    pub killed: bool,
+    // frozen 字段表示进程目前是否已收到 SIGSTOP 信号被暂停
+    // if the task is frozen by a signal
+    pub frozen: bool,
+    // trap_ctx_backup 则表示进程执行信号处理例程之前的 Trap 上下文
+    pub trap_ctx_backup: Option<TrapContext>,
     // 应用动态内存分配的堆空间的大小
     // pub heap_bottom: usize,
     // pub program_brk: usize,
@@ -81,6 +99,7 @@ impl TaskControlBlockInner {
     pub fn is_zombie(&self) -> bool {
         self.get_status() == TaskStatus::Zombie
     }
+    // 在进程控制块中分配一个最小的空闲文件描述符来访问一个新打开的文件。它先从小到大遍历所有曾经被分配过的文件描述符尝试找到一个空闲的，如果没有的话就需要拓展文件描述符表的长度并新分配一个
     pub fn alloc_fd(&mut self) -> usize {
         if let Some(fd) = (0..self.fd_table.len()).find(|fd: &usize| self.fd_table[*fd].is_none()) {
             fd
@@ -124,6 +143,7 @@ impl TaskControlBlock {
                     parent: None,
                     children: Vec::new(),
                     exit_code: 0,
+                    // 当一个进程被创建的时候，内核会默认为其打开三个缺省就存在的文件：文件描述符为 0 的标准输入、文件描述符为 1 的标准输出、文件描述符为 2 的标准错误输出
                     fd_table: vec![
                         // 0 -> stdin
                         Some(Arc::new(Stdin)),
@@ -132,6 +152,13 @@ impl TaskControlBlock {
                         // 2 -> stderr
                         Some(Arc::new(Stdout)),
                     ],
+                    signals: SignalFlags::empty(),
+                    signal_mask: SignalFlags::empty(),
+                    handling_sig: -1,
+                    signal_actions: SignalActions::default(),
+                    killed: false,
+                    frozen: false,
+                    trap_ctx_backup: None,
                 })
             },
         };
@@ -148,14 +175,40 @@ impl TaskControlBlock {
         task_control_block
     }
     // exec 用来实现 exec 系统调用，即当前进程加载并执行另一个 ELF 格式可执行文件
-    pub fn exec(&self, elf_data: &[u8]) {
+    pub fn exec(&self, elf_data: &[u8], args: Vec<String>) {
         // memory_set with elf program headers/trampoline/trap context/user stack
-        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let (memory_set, mut user_sp, entry_point) = MemorySet::from_elf(elf_data);
         let trap_cx_ppn = memory_set
             .translate(VirtAddr::from(TRAP_CONTEXT).into())
             .unwrap()
             .ppn();
-
+        // 首先需要在用户栈上分配一个字符串指针数组。数组中的每个元素都指向一个用户栈更低处的命令行参数字符串的起始地址
+        // push arguments on user stack
+        user_sp -= (args.len() + 1) * core::mem::size_of::<usize>();
+        let argv_base = user_sp;
+        let mut argv: Vec<_> = (0..=args.len())
+            .map(|arg| {
+                translated_refmut(
+                    memory_set.token(),
+                    (argv_base + arg * core::mem::size_of::<usize>()) as *mut usize,
+                )
+            })
+            .collect();
+        *argv[args.len()] = 0;
+        // 我们逐个将传入的 args 中的字符串压入到用户栈中
+        for i in 0..args.len() {
+            user_sp -= args[i].len() + 1;
+            *argv[i] = user_sp;
+            let mut p = user_sp;
+            for c in args[i].as_bytes() {
+                *translated_refmut(memory_set.token(), p as *mut u8) = *c;
+                p += 1;
+            }
+            *translated_refmut(memory_set.token(), p as *mut u8) = 0;
+        }
+        // 将 user_sp 以 8 字节对齐。这是因为命令行参数的长度不一，很有可能压入之后 user_sp 没有对齐到 8 字节
+        // make the user_sp aligned to 8B for k210 platform
+        user_sp -= user_sp % core::mem::size_of::<usize>();
         // **** access inner exclusively
         let mut inner = self.inner_exclusive_access();
         // 从 ELF 文件生成一个全新的地址空间并直接替换进来，这将导致原有的地址空间生命周期结束，里面包含的全部物理页帧都会被回收
@@ -175,7 +228,10 @@ impl TaskControlBlock {
             self.kernel_stack.get_top(),
             trap_handler as usize,
         );
-
+        // 修改 Trap 上下文中的 a0/a1 寄存器，让 a0 表示命令行参数的个数，而 a1 则表示图中 argv_base 即字符串指针数组的起始地址
+        // 这两个参数在第一次进入对应应用的用户态的时候会被接收并用于还原命令行参数
+        trap_cx.x[10] = args.len();
+        trap_cx.x[11] = argv_base;
         // 无需对任务上下文进行处理，因为这个进程本身已经在执行了，而只有被暂停的应用才需要在内核栈上保留一个任务上下文
         
         // **** release inner automatically
@@ -224,6 +280,14 @@ impl TaskControlBlock {
                     children: Vec::new(),
                     exit_code: 0,
                     fd_table: new_fd_table,
+                    signals: SignalFlags::empty(),
+                    // inherit the signal_mask and signal_action
+                    signal_mask: parent_inner.signal_mask,
+                    handling_sig: -1,
+                    signal_actions: parent_inner.signal_actions.clone(),
+                    killed: false,
+                    frozen: false,
+                    trap_ctx_backup: None,
                 })
             },
         });

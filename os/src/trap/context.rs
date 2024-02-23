@@ -3,6 +3,7 @@ use riscv::register::sstatus::{self, Sstatus, SPP};
 
 // 告诉编译器使用 C 语言风格的内存布局
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub struct TrapContext {
     /// general regs[0..31]
     pub x: [usize; 32],

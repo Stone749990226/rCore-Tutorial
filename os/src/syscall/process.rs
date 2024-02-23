@@ -1,13 +1,15 @@
 //! App management syscalls
 // use crate::batch::run_next_app;
 use crate::fs::{open_file, OpenFlags};
-use crate::mm::{translated_refmut, translated_str};
+use crate::mm::{translated_ref, translated_refmut, translated_str};
 use crate::task::{
-    add_task, current_task, current_user_token, exit_current_and_run_next,
-    suspend_current_and_run_next,
+    add_task, current_task, current_user_token, exit_current_and_run_next, pid2task,
+    suspend_current_and_run_next, SignalAction, SignalFlags, MAX_SIG,
 };
 use crate::timer::get_time_ms;
+use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 pub fn sys_exit(exit_code: i32) -> ! {
     exit_current_and_run_next(exit_code);
@@ -58,36 +60,38 @@ pub fn sys_fork() -> isize {
 }
 
 /// 功能：将当前进程的地址空间清空并加载一个特定的可执行文件，返回用户态后开始它的执行。
-/// 参数：path 给出了要加载的可执行文件的名字；
+/// 参数：path 给出了要加载的可执行文件的名字；args 指向命令行参数字符串起始地址数组中的一个位置
 /// 返回值：如果出错的话（如找不到名字相符的可执行文件）则返回 -1，否则不应该返回。
 /// syscall ID：221
 // path 作为 &str 类型是一个胖指针，既有起始地址又包含长度信息。在实际进行系统调用的时候，我们只会将起始地址传给内核（对标 C 语言仅会传入一个 char* ）。这就需要应用负责在传入的字符串的末尾加上一个 \0 ，这样内核才能知道字符串的长度。
-pub fn sys_exec(path: *const u8) -> isize {
+pub fn sys_exec(path: *const u8, mut args: *const usize) -> isize {
     let token = current_user_token();
     // 调用 translated_str 找到要执行的应用名
     let path = translated_str(token, path);
+    let mut args_vec: Vec<String> = Vec::new();
+    loop {
+        let arg_str_ptr = *translated_ref(token, args);
+        if arg_str_ptr == 0 {
+            break;
+        }
+        // 每次我们都可以从一个起始地址通过 translated_str 拿到一个字符串，直到 args 为 0 就说明没有更多命令行参数了
+        args_vec.push(translated_str(token, arg_str_ptr as *const u8));
+        unsafe {
+            args = args.add(1);
+        }
+    }
     // 有了文件系统支持之后，我们在 sys_exec 所需的应用的 ELF 文件格式的数据就不再需要通过应用加载器从内核的数据段获取，而是从文件系统中获取，这样内核与应用的代码/数据就解耦了
     // 调用 open_file 函数，以只读的方式在内核中打开应用文件并获取它对应的 OSInode
     if let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
-        // 通过 OSInode::read_all 将该文件的数据全部读到一个向量 all_data 中
         let all_data = app_inode.read_all();
         let task = current_task().unwrap();
-        task.exec(all_data.as_slice());
-        0
+        let argc = args_vec.len();
+        task.exec(all_data.as_slice(), args_vec);
+        // return argc because cx.x[10] will be covered with it later
+        argc as isize
     } else {
         -1
     }
-    // ch6之前：
-    // 在应用加载器提供的 get_app_data_by_name 接口中找到对应的 ELF 格式的数据
-    // if let Some(data) = get_app_data_by_name(path.as_str()) {
-    //     // 如果找到，就调用 TaskControlBlock::exec 替换掉地址空间并返回 0。这个返回值其实并没有意义，因为我们在替换地址空间的时候本来就对 Trap 上下文重新进行了初始化
-    //     let task = current_task().unwrap();
-    //     task.exec(data);
-    //     0
-    // } else {
-    //     // 如果没有找到，就不做任何事情并返回 -1。在shell程序user_shell中我们也正是通过这个返回值来判断要执行的应用是否存在
-    //     -1
-    // }
 }
 
 /// 功能：当前进程等待一个子进程变为僵尸进程，回收其全部资源并收集其返回值。
@@ -140,4 +144,103 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
         -2
     }
     // ---- release current PCB lock automatically
+}
+
+pub fn sys_kill(pid: usize, signum: i32) -> isize {
+    if let Some(task) = pid2task(pid) {
+        if let Some(flag) = SignalFlags::from_bits(1 << signum) {
+            // insert the signal if legal
+            let mut task_ref = task.inner_exclusive_access();
+            if task_ref.signals.contains(flag) {
+                return -1;
+            }
+            task_ref.signals.insert(flag);
+            0
+        } else {
+            -1
+        }
+    } else {
+        -1
+    }
+}
+
+// 进程可以通过 sigprocmask 系统调用直接设置自身的全局信号掩码
+pub fn sys_sigprocmask(mask: u32) -> isize {
+    if let Some(task) = current_task() {
+        let mut inner = task.inner_exclusive_access();
+        let old_mask = inner.signal_mask;
+        if let Some(flag) = SignalFlags::from_bits(mask) {
+            inner.signal_mask = flag;
+            old_mask.bits() as isize
+        } else {
+            -1
+        }
+    } else {
+        -1
+    }
+}
+
+// 在信号处理例程的结尾需要插入这个系统调用来结束信号处理并继续进程原来的执行
+pub fn sys_sigreturn() -> isize {
+    if let Some(task) = current_task() {
+        let mut inner = task.inner_exclusive_access();
+        inner.handling_sig = -1;
+        // 只是将进程控制块中保存的记录了处理信号之前的进程上下文的 trap_ctx_backup 覆盖到当前的 Trap 上下文。这样接下来 Trap 回到用户态就会继续原来进程的执行了
+        // restore the trap context
+        let trap_ctx = inner.get_trap_cx();
+        *trap_ctx = inner.trap_ctx_backup.unwrap();
+        // Here we return the value of a0 in the trap_ctx,
+        // otherwise it will be overwritten after we trap
+        // back to the original execution of the application.
+        trap_ctx.x[10] as isize
+    } else {
+        -1
+    }
+}
+
+// check_sigaction_error 用来检查 sigaction 的参数是否有错误（有错误的话返回 true）
+fn check_sigaction_error(signal: SignalFlags, action: usize, old_action: usize) -> bool {
+    // 这里的检查比较简单，如果传入的 action 或者 old_action 为空指针则视为错误
+    // 另一种错误则是信号类型为 SIGKILL 或者 SIGSTOP ，这是因为我们的内核参考 Linux 内核规定不允许进程对这两种信号设置信号处理例程，而只能由内核对它们进行处理
+    if action == 0
+        || old_action == 0
+        || signal == SignalFlags::SIGKILL
+        || signal == SignalFlags::SIGSTOP
+    {
+        true
+    } else {
+        false
+    }
+}
+
+/// 功能：为当前进程设置某种信号的处理函数，同时保存设置之前的处理函数。
+/// 进程可以通过 sigaction 系统调用捕获某种信号，即：当接收到某种信号的时候，暂停进程当前的执行，调用进程为该种信号提供的函数对信号进行处理，处理完成之后再恢复进程原先的执行
+/// 参数：signum 表示信号的编号，action 表示要设置成的处理函数的指针
+/// old_action 表示用于保存设置之前的处理函数的指针。
+/// 返回值：如果传入参数错误（比如传入的 action 或 old_action 为空指针或者信号类型不存在返回 -1 ，否则返回 0 ）
+/// syscall ID: 134
+pub fn sys_sigaction(
+    signum: i32,
+    action: *const SignalAction,
+    old_action: *mut SignalAction,
+) -> isize {
+    let token = current_user_token();
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if signum as usize > MAX_SIG {
+        return -1;
+    }
+    if let Some(flag) = SignalFlags::from_bits(1 << signum) {
+        // check_sigaction_error 用来检查 sigaction 的参数是否有错误（有错误的话返回 true）
+        if check_sigaction_error(flag, action as usize, old_action as usize) {
+            return -1;
+        }
+        let prev_action = inner.signal_actions.table[signum as usize];
+        // 使用 translated_ref(mut) 将进程提交的信号处理例程保存到进程控制块
+        *translated_refmut(token, old_action) = prev_action;
+        inner.signal_actions.table[signum as usize] = *translated_ref(token, action);
+        0
+    } else {
+        -1
+    }
 }
